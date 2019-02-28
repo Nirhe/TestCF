@@ -26,6 +26,39 @@ exports.isCorrectFolder = function (file) {
 };
 
 
+exports.validateCheckSum = function (file) {
+
+    return new Promise(function (resolve, reject) {
+
+        const storage = Storage();
+        storage
+            .bucket(file.bucket)
+            .file(file.name)
+            .getMetadata()
+            .then(results => {
+                    const metadata = results[0];
+                    getCheckSumFromDTS(file.name).then(
+                        response => {
+                            resolve(metadata.md5Hash === response.responsebody);
+                        })
+                }
+            )
+            .catch(err => {
+                console.error('ERROR:', err);
+                reject();
+            });
+    });
+}
+
+
+function getCheckSumFromDTS(fileName) {
+
+    var fixedFileName = fileName.replace("relex_output/", "");
+    return Promise.resolve(outboundHandler.getCheckSumFromDTS(fixedFileName));
+
+}
+
+
 exports.decompressOutput = function (file) {
 
     var storage = new Storage({projectId: process.env.PROJECT_ID});
@@ -41,7 +74,8 @@ exports.decompressOutput = function (file) {
     };
 
     console.log(`The file ${file.name} has been successfully picked up and going to be stored in table ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId}.`);
-    outboundHandler.sendStatusUpdate(file.name,process.env.IN_PROGRESS_CODE);
+    outboundHandler.sendStatusUpdate(file.name, process.env.IN_PROGRESS_CODE);
+    var errorsState = false;
 
 // Loads data from a Google Cloud Storage file into the table
     bigquery
@@ -56,21 +90,37 @@ exports.decompressOutput = function (file) {
 
                 // Check the job's status for errors
                 const errors = job.status.errors;
+
                 if (errors && errors.length > 0) {
                     console.log(`Errors: ${JSON.stringify(errors)}`);
+                    errorsState = true;
                     throw errors;
                 }
                 else if (job.status.state == 'DONE') {
-                    console.log(`The file ${file.name} has been successfully stored in ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId}.`);
-                    outboundHandler.sendStatusUpdate(file.name, process.env.SUCCESS_CODE).then(
-                        outboundHandler.checkRunStatus(file.name));
+
+                    if (!errorsState) {
+                        console.log(`Data from file ${file.name} has been successfully stored in ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId}.`);
+                        outboundHandler.sendStatusUpdate(file.name, process.env.SUCCESS_CODE).then( response => {
+                            if (response.responsebody.includes("Updated")) {
+                                outboundHandler.checkRunStatus(file.name);
+                            } else {
+                                outboundHandler.sendStatusEmail(`The cloud function did not get an appropriate response from DataTransferService when 
+                                    updating the file status. Please check to see that the file (${file.name}) exists in the DataTransferService 
+                                    tracking tables and that the file name shown here is correct.`)
+                            }
+                        });
+                    }
+
                 }
             }
         ).catch(err => {
         console.error(`Error storing data from '${file.bucket}/${file.name}' in ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId}:`, err);
-        outboundHandler.checkRunStatus(file.name);
-        outboundHandler.sendStatusEmail(`The file '${file.bucket}/${file.name}' has failed to store in ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId} .`);
+        outboundHandler.sendStatusUpdate(file.name, process.env.FAILURE_CODE);
+        outboundHandler.sendStatusEmail(`The file '${file.bucket}/${file.name}' has failed to store in ${process.env.PROJECT_ID}:${process.env.DATASET_ID}.${tableId}.
+            Please re-play the file into the appropriate bucket, so we can re-trigger the cloud function as a work-around for this error.`);
     });
+
+    console.log(`BQ job has started for file ${file.name}`)
 
 };
 
@@ -85,3 +135,6 @@ function getTableID(file) {
 
     return process.env.RELEX_OUTPUT_TABLE_NAME;
 }
+
+
+
